@@ -32,7 +32,15 @@ test -f "$installed/scripts/image_gen.py"
 test -f "$installed/references/cli.md"
 test -f "$installed/references/troubleshooting.md"
 
-PYTHONPYCACHEPREFIX="$test_home/pycache" python "$installed/scripts/image_gen.py" \
+env \
+  -u PI_IMAGEGEN_BASE_URL \
+  -u OPENAI_BASE_URL \
+  -u PI_IMAGEGEN_API_KEY \
+  -u OPENAI_API_KEY \
+  -u PI_IMAGEGEN_MODEL \
+  -u PI_IMAGEGEN_OUTPUT_DIR \
+  -u PI_CODING_AGENT_DIR \
+  PYTHONPYCACHEPREFIX="$test_home/pycache" python "$installed/scripts/image_gen.py" \
   generate \
   --prompt "A tiny red cube on a white background" \
   --out "$test_home/cube.png" \
@@ -50,4 +58,16 @@ assert payload["outputs"][0].endswith("/cube.png")
 assert payload["prompt"] == "Primary request: A tiny red cube on a white background"
 PY
 
-printf 'Imagegen skill packaging verified.\n'
+env \
+  -u PI_IMAGEGEN_BASE_URL \
+  -u OPENAI_BASE_URL \
+  -u PI_IMAGEGEN_API_KEY \
+  -u OPENAI_API_KEY \
+  -u PI_IMAGEGEN_MODEL \
+  -u PI_IMAGEGEN_OUTPUT_DIR \
+  -u PI_CODING_AGENT_DIR \
+  -u IMAGEGEN_SCRIPT \
+  PYTHONPYCACHEPREFIX="$test_home/pycache" \
+  python -m unittest discover -s "$repo_root/tests" -v
+
+printf 'Imagegen skill packaging and behavior verified.\n'

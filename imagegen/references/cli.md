@@ -6,7 +6,7 @@ Use the bundled CLI for all image generation and editing work in this skill.
 python "$PI_SKILL_DIR/scripts/image_gen.py" <command> [options]
 ```
 
-The CLI uses direct HTTP requests to an OpenAI-compatible image endpoint. It does not require the OpenAI Python SDK.
+The CLI uses direct HTTP requests to an OpenAI-compatible image endpoint. It does not require the OpenAI Python SDK. The endpoint can be a direct upstream service or a generic proxy.
 
 ## Configuration
 
@@ -32,7 +32,7 @@ For current endpoint/model/auth/output defaults, read `references/troubleshootin
 
 ## Commands
 
-- `models` — list models exposed by the endpoint.
+- `models` — optionally list models exposed by the endpoint.
 - `generate` — create one or more images from a prompt.
 - `edit` — edit one or more input images.
 - `generate-batch` — generate from a JSONL file.
@@ -43,7 +43,7 @@ For current endpoint/model/auth/output defaults, read `references/troubleshootin
 python "$PI_SKILL_DIR/scripts/image_gen.py" models
 ```
 
-If this fails or returns unexpected models, read `references/troubleshooting.md`.
+Generation does not call this command first. If this command fails, generation can still work when the image routes work.
 
 ## Generate
 
@@ -55,9 +55,9 @@ python "$PI_SKILL_DIR/scripts/image_gen.py" generate \
 Useful options:
 
 ```bash
---model gpt-image-2
---size 1024x1024          # 1024x1024, 1536x1024, 1024x1536, auto
---quality auto            # low, medium, high, auto
+--model gpt-image-2.5-flare
+--size 1024x1024          # auto or positive ASCII WIDTHxHEIGHT
+--quality auto            # low, medium, high, xhigh, max, auto
 --background transparent  # transparent, opaque, auto
 --output-format png       # png, jpeg, webp
 --n 4                     # variants, 1-10
@@ -68,6 +68,8 @@ Useful options:
 ```
 
 The script refuses to overwrite existing outputs unless `--force` is set.
+
+The CLI prints the requested model and size for each saved image. It prints backend model and size only when the response reports them. It measures PNG, JPEG, and WebP dimensions from the saved bytes when possible. It prints `unavailable` when a value is missing or cannot be inspected.
 
 ## Edit
 
@@ -115,7 +117,7 @@ python "$PI_SKILL_DIR/scripts/image_gen.py" generate-batch \
   --concurrency 3
 ```
 
-Per-job keys may override shared CLI values: `model`, `n`, `size`, `quality`, `background`, `output_format`, `output_compression`, `moderation`, `out`, and prompt-scaffolding fields such as `use_case`, `asset_type`, `style`, `composition`, `constraints`, and `negative`.
+Per-job keys may override shared CLI values: `model`, `n`, `size`, `quality`, `background`, `output_format`, `output_compression`, `moderation`, `out`, and prompt-scaffolding fields such as `use_case`, `asset_type`, `style`, `composition`, `constraints`, and `negative`. The model value can be any non-empty provider-defined name.
 
 ## Prompt scaffolding flags
 

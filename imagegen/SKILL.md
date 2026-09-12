@@ -1,6 +1,6 @@
 ---
-name: "imagegen"
-description: "Generate or edit raster images from Pi through the bundled OpenAI-compatible image CLI. Use for bitmap visuals: photos, illustrations, textures, sprites, product mockups, UI mockups, transparent-background cutouts, or raster image edits. Do not use when SVG/vector/code-native assets are the better fit."
+name: imagegen
+description: "Generate or edit raster images. Use for bitmap visuals: photos, illustrations, textures, sprites, product mockups, UI mockups, or transparent-background cutouts. Do not use when SVG/vector/code-native assets are the better fit."
 ---
 
 # Image Generation Skill for Pi
@@ -14,7 +14,8 @@ python "$PI_SKILL_DIR/scripts/image_gen.py" ...
 ## Core contract
 
 - The CLI is the implementation boundary: `scripts/image_gen.py`.
-- Let the CLI/env choose endpoint, model, auth, and default preview output path.
+- The client sends direct HTTP to the configured OpenAI-compatible endpoint. It does not require the OpenAI Python SDK.
+- Let the CLI/env choose endpoint, model, auth, and default preview output path. Generation does not require model discovery.
 - For setup, env precedence, current defaults, curl tests, or failures, read `references/troubleshooting.md` lazily.
 - For command details beyond the minimal examples below, read `references/cli.md` lazily.
 
@@ -49,11 +50,28 @@ Do not use it for SVG/vector/code-native assets, deterministic diagrams, or edit
 ## Workflow
 
 1. Confirm the task needs a raster image.
-2. Build a short structured prompt using only useful fields from the schema below.
-3. Run the CLI; use `--dry-run` first for complex commands.
-4. Check output path and file metadata; visually inspect when possible.
-5. Iterate with one targeted change if needed.
-6. Report final path, model, endpoint, and final prompt.
+2. Choose quality and dimensions using the rules below.
+3. Build a short structured prompt using only useful fields from the schema below.
+4. Run the CLI; use `--dry-run` first for complex commands.
+5. Check output path and file metadata; visually inspect when possible.
+6. Iterate with one targeted change if needed, within the agreed budget and output count.
+7. Report final path, requested model, backend model when available, endpoint, and final prompt.
+
+The CLI reports the requested size and backend-reported size when available. It measures saved-image size when it can inspect the file bytes. It reports `unavailable` instead of guessing. C2PA metadata alone is not definitive proof of the actual served model.
+
+## Choose quality and dimensions
+
+Infer ordinary settings from the request and target layout. Do not ask the user to choose CLI flags when their intent is clear. Set quality and dimensions with CLI flags, not words such as "4K" in the prompt.
+
+- Preserve explicit model, quality, dimensions, and output-count choices. Do not switch providers or billing paths to satisfy a parameter.
+- Keep `quality=auto` for ordinary requests without a stronger requirement. For explicitly requested drafts or cheap exploration, choose `low` unless the user specifies another quality.
+- Consider `high` for a concrete requirement such as legible small text. Use `xhigh` or `max` only to address a named requirement that lower settings leave unmet. Higher quality settings do not guarantee better results.
+- When an approved iteration falls short, change one setting at a time. Do not generate extra comparisons or variants without authorization.
+- Infer orientation and dimensions from the target layout. Keep the default `1024x1024` when no layout requirement exists. For custom dimensions or higher quality, read the provider guidance in `references/image-api.md` before choosing values.
+- For edits, inspect the input dimensions and preserve its framing unless the user requests a change. Use matching dimensions when supported. Do not assume `size=auto` preserves framing on every endpoint.
+- Ask one concise question if a missing requirement blocks success, or an increase exceeds an agreed cost or latency limit. If a proposed expensive increase has no clear budget, ask before proceeding. Do not silently round an unsupported size, crop the output, or substitute another model. Explain the limitation and ask when an alternative changes the result.
+
+Before an expensive request, state the planned dimensions, quality, and count. This CLI's `--dry-run` previews the request only. It does not estimate cost or confirm provider support. Compare the returned dimensions with the request and report any mismatch.
 
 ## Minimal examples
 
@@ -119,6 +137,6 @@ Taxonomy and copy/paste prompt recipes live in `references/prompting.md` and `re
 
 - `references/troubleshooting.md`: setup, env vars, defaults, direct curl tests, failure recovery.
 - `references/cli.md`: command usage and batch/advanced examples.
-- `references/image-api.md`: API parameters and endpoint behavior.
+- `references/image-api.md`: API parameters, model-specific selection guidance, and endpoint behavior.
 - `references/prompting.md`: prompting principles and taxonomy.
 - `references/sample-prompts.md`: copy/paste prompt recipes.

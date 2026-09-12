@@ -3,7 +3,7 @@
 
 The CLI intentionally talks to the HTTP API directly instead of depending on the
 OpenAI Python SDK. That keeps the skill portable inside Pi installations and
-works with local proxies such as http://localhost:8317/v1.
+works with direct upstream endpoints and generic proxies.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import random
 import re
+import struct
 import string
 import sys
 import time
@@ -27,7 +28,7 @@ from urllib.parse import urljoin, urlparse
 
 from io import BytesIO
 
-DEFAULT_MODEL = "gpt-image-2"
+DEFAULT_MODEL = "gpt-image-2.5-flare"
 DEFAULT_BASE_URL = "http://localhost:8317/v1"
 DEFAULT_SIZE = "1024x1024"
 DEFAULT_QUALITY = "auto"
@@ -35,8 +36,7 @@ DEFAULT_OUTPUT_FORMAT = "png"
 DEFAULT_CONCURRENCY = 3
 DEFAULT_DOWNSCALE_SUFFIX = "-web"
 
-ALLOWED_SIZES = {"1024x1024", "1536x1024", "1024x1536", "auto"}
-ALLOWED_QUALITIES = {"low", "medium", "high", "auto"}
+ALLOWED_QUALITIES = {"low", "medium", "high", "xhigh", "max", "auto"}
 ALLOWED_BACKGROUNDS = {"transparent", "opaque", "auto", None}
 ALLOWED_INPUT_FIDELITIES = {"low", "high", None}
 
@@ -44,6 +44,22 @@ MAX_IMAGE_BYTES = 50 * 1024 * 1024
 MAX_BATCH_JOBS = 500
 REQUEST_TIMEOUT_SECONDS = 300
 TROUBLESHOOTING_PATH = Path(__file__).resolve().parents[1] / "references" / "troubleshooting.md"
+MAX_DIAGNOSTIC_CHARS = 300
+DIAGNOSTIC_SENSITIVE_KEYS = {
+    "apikey",
+    "authorization",
+    "b64json",
+    "base64",
+    "image",
+    "images",
+    "password",
+    "secret",
+    "token",
+}
+DIAGNOSTIC_TOKEN_PATTERNS = (
+    re.compile(r"(?i)\bsk-[A-Za-z0-9_-]+\b"),
+    re.compile(r"(?i)\b(?:bearer|token|secret|api[_ -]?key)\s*[:=]\s*[^\s,;]+"),
+)
 
 
 class ImageGenError(RuntimeError):
@@ -167,13 +183,18 @@ def _normalize_output_format(fmt: Optional[str]) -> str:
 
 
 def _validate_size(size: str) -> None:
-    if size not in ALLOWED_SIZES:
-        _die("size must be one of 1024x1024, 1536x1024, 1024x1536, or auto.")
+    if size == "auto":
+        return
+    if not isinstance(size, str) or not re.fullmatch(r"[1-9][0-9]*x[1-9][0-9]*", size):
+        _die(
+            "size must be auto or WIDTHxHEIGHT with positive ASCII integer dimensions "
+            "(for example 1024x1024)."
+        )
 
 
 def _validate_quality(quality: str) -> None:
     if quality not in ALLOWED_QUALITIES:
-        _die("quality must be one of low, medium, high, or auto.")
+        _die("quality must be one of low, medium, high, xhigh, max, or auto.")
 
 
 def _validate_background(background: Optional[str]) -> None:
@@ -201,8 +222,10 @@ def _validate_generate_payload(payload: Dict[str, Any]) -> None:
     n = int(payload.get("n", 1))
     if n < 1 or n > 10:
         _die("n must be between 1 and 10")
-    _validate_size(str(payload.get("size", DEFAULT_SIZE)))
-    _validate_quality(str(payload.get("quality", DEFAULT_QUALITY)))
+    size = payload.get("size", DEFAULT_SIZE)
+    quality = payload.get("quality", DEFAULT_QUALITY)
+    _validate_size(size if isinstance(size, str) else "")
+    _validate_quality(quality if isinstance(quality, str) else "")
     _validate_background(payload.get("background"))
     oc = payload.get("output_compression")
     if oc is not None and not (0 <= int(oc) <= 100):
@@ -278,6 +301,88 @@ def _derive_downscale_path(path: Path, suffix: str) -> Path:
     return path.with_name(f"{path.stem}{suffix}{path.suffix}")
 
 
+def _valid_dimensions(width: int, height: int) -> Optional[Tuple[int, int]]:
+    if width < 1 or height < 1:
+        return None
+    return width, height
+
+
+def _png_dimensions(image_bytes: bytes) -> Optional[Tuple[int, int]]:
+    if not image_bytes.startswith(b"\x89PNG\r\n\x1a\n") or len(image_bytes) < 24:
+        return None
+    if image_bytes[12:16] != b"IHDR":
+        return None
+    return _valid_dimensions(*struct.unpack(">II", image_bytes[16:24]))
+
+
+def _jpeg_dimensions(image_bytes: bytes) -> Optional[Tuple[int, int]]:
+    if not image_bytes.startswith(b"\xff\xd8"):
+        return None
+
+    start_of_frame_markers = {
+        0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+        0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
+    }
+    offset = 2
+    while offset + 1 < len(image_bytes):
+        if image_bytes[offset] != 0xFF:
+            offset += 1
+            continue
+        while offset < len(image_bytes) and image_bytes[offset] == 0xFF:
+            offset += 1
+        if offset >= len(image_bytes):
+            return None
+        marker = image_bytes[offset]
+        offset += 1
+        if marker == 0xDA:
+            return None
+        if marker in {0x01, 0xD8, 0xD9} or 0xD0 <= marker <= 0xD7:
+            continue
+        if offset + 2 > len(image_bytes):
+            return None
+        segment_length = struct.unpack(">H", image_bytes[offset : offset + 2])[0]
+        if segment_length < 2 or offset + segment_length > len(image_bytes):
+            return None
+        if marker in start_of_frame_markers and segment_length >= 7:
+            height, width = struct.unpack(">HH", image_bytes[offset + 3 : offset + 7])
+            return _valid_dimensions(width, height)
+        offset += segment_length
+    return None
+
+
+def _webp_dimensions(image_bytes: bytes) -> Optional[Tuple[int, int]]:
+    if not (image_bytes.startswith(b"RIFF") and image_bytes[8:12] == b"WEBP"):
+        return None
+    if len(image_bytes) < 20:
+        return None
+    chunk_type = image_bytes[12:16]
+    if chunk_type == b"VP8X" and len(image_bytes) >= 30:
+        width = 1 + int.from_bytes(image_bytes[24:27], "little")
+        height = 1 + int.from_bytes(image_bytes[27:30], "little")
+        return _valid_dimensions(width, height)
+    if chunk_type == b"VP8L" and len(image_bytes) >= 25:
+        if image_bytes[20] != 0x2F:
+            return None
+        width = 1 + (image_bytes[21] | ((image_bytes[22] & 0x3F) << 8))
+        height = 1 + ((image_bytes[22] >> 6) | (image_bytes[23] << 2) | ((image_bytes[24] & 0x0F) << 10))
+        return _valid_dimensions(width, height)
+    if chunk_type == b"VP8 " and len(image_bytes) >= 30:
+        if image_bytes[23:26] != b"\x9d\x01\x2a":
+            return None
+        width = int.from_bytes(image_bytes[26:28], "little") & 0x3FFF
+        height = int.from_bytes(image_bytes[28:30], "little") & 0x3FFF
+        return _valid_dimensions(width, height)
+    return None
+
+
+def _image_dimensions(image_bytes: bytes) -> Optional[Tuple[int, int]]:
+    for reader in (_png_dimensions, _jpeg_dimensions, _webp_dimensions):
+        dimensions = reader(image_bytes)
+        if dimensions is not None:
+            return dimensions
+    return None
+
+
 def _downscale_image_bytes(image_bytes: bytes, *, max_dim: int, output_format: str) -> bytes:
     try:
         from PIL import Image
@@ -318,7 +423,8 @@ def _write_images(
     downscale_max_dim: Optional[int],
     downscale_suffix: str,
     output_format: str,
-) -> None:
+) -> List[Dict[str, Any]]:
+    saved: List[Dict[str, Any]] = []
     for idx, raw in enumerate(image_bytes):
         if idx >= len(outputs):
             break
@@ -327,7 +433,14 @@ def _write_images(
             _die(f"Output already exists: {out_path} (use --force to overwrite)")
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_bytes(raw)
-        print(f"Wrote {out_path}")
+        saved.append(
+            {
+                "index": idx + 1,
+                "label": str(idx + 1),
+                "path": out_path,
+                "dimensions": _image_dimensions(raw),
+            }
+        )
 
         if downscale_max_dim is None:
             continue
@@ -336,7 +449,103 @@ def _write_images(
             _die(f"Output already exists: {derived} (use --force to overwrite)")
         resized = _downscale_image_bytes(raw, max_dim=downscale_max_dim, output_format=output_format)
         derived.write_bytes(resized)
-        print(f"Wrote {derived}")
+        saved.append(
+            {
+                "index": idx + 1,
+                "label": f"{idx + 1} downscaled",
+                "path": derived,
+                "dimensions": _image_dimensions(resized),
+            }
+        )
+    return saved
+
+
+def _ensure_output_paths_available(
+    outputs: Sequence[Path],
+    *,
+    force: bool,
+    downscale_max_dim: Optional[int],
+    downscale_suffix: str,
+) -> None:
+    if force:
+        return
+    candidates: List[Path] = list(outputs)
+    if downscale_max_dim is not None:
+        candidates.extend(_derive_downscale_path(path, downscale_suffix) for path in outputs)
+    for path in candidates:
+        if path.exists():
+            _die(f"Output already exists: {path} (use --force to overwrite)")
+
+
+def _print_saved_paths(saved: Sequence[Dict[str, Any]]) -> None:
+    for item in saved:
+        print(f"Wrote {item['path']}")
+
+
+def _response_data_item(response: Dict[str, Any], index: int) -> Dict[str, Any]:
+    data = response.get("data")
+    if isinstance(data, list) and index < len(data) and isinstance(data[index], dict):
+        return data[index]
+    return {}
+
+
+def _response_metadata(response: Dict[str, Any], index: int, key: str) -> str:
+    item = _response_data_item(response, index)
+    value = item.get(key)
+    if value is None or value == "":
+        value = response.get(key)
+    if isinstance(value, (str, int, float, bool)) and str(value):
+        return str(value)
+    return "unavailable"
+
+
+def _compact_response_for_reporting(response: Dict[str, Any]) -> Dict[str, Any]:
+    compact: Dict[str, Any] = {}
+    for key in ("model", "size"):
+        value = response.get(key)
+        if isinstance(value, (str, int, float, bool)):
+            compact[key] = value
+
+    data = response.get("data")
+    if isinstance(data, list):
+        compact_data: List[Dict[str, Any]] = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            compact_item: Dict[str, Any] = {}
+            for key in ("model", "size", "revised_prompt"):
+                value = item.get(key)
+                if isinstance(value, (str, int, float, bool)):
+                    compact_item[key] = value
+            compact_data.append(compact_item)
+        compact["data"] = compact_data
+    return compact
+
+
+def _format_dimensions(dimensions: Optional[Tuple[int, int]]) -> str:
+    if dimensions is None:
+        return "unavailable"
+    return f"{dimensions[0]}x{dimensions[1]}"
+
+
+def _print_image_reports(
+    response: Dict[str, Any],
+    saved: Sequence[Dict[str, Any]],
+    *,
+    requested_model: str,
+    requested_size: str,
+    prefix: str = "",
+) -> None:
+    for item in saved:
+        index = int(item["index"]) - 1
+        print(
+            f"{prefix}Image {item['label']}: path={item['path']} "
+            f"requested_model={requested_model} "
+            f"backend_model={_response_metadata(response, index, 'model')} "
+            f"requested_size={requested_size} "
+            f"backend_size={_response_metadata(response, index, 'size')} "
+            f"measured_size={_format_dimensions(item['dimensions'])}"
+        )
 
 
 def _fields_from_args(args: argparse.Namespace) -> Dict[str, Optional[str]]:
@@ -429,13 +638,70 @@ def _get_json(*, base_url: str, api_key: str, path: str, timeout: int = 60) -> D
     return _send_request(req, timeout=timeout)
 
 
+def _diagnostic_preview(text: str) -> str:
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    for pattern in DIAGNOSTIC_TOKEN_PATTERNS:
+        text = pattern.sub("[redacted]", text)
+    if len(text) > MAX_DIAGNOSTIC_CHARS:
+        return text[:MAX_DIAGNOSTIC_CHARS] + "..."
+    return text or "empty response"
+
+
+def _diagnostic_value(value: Any, depth: int = 0) -> Any:
+    if depth > 2:
+        return "[omitted]"
+    if isinstance(value, dict):
+        safe: Dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            normalized_key = re.sub(r"[^a-z0-9]", "", key_text.lower())
+            safe[key_text] = (
+                "[omitted]"
+                if normalized_key in DIAGNOSTIC_SENSITIVE_KEYS
+                else _diagnostic_value(item, depth + 1)
+            )
+        return safe
+    if isinstance(value, list):
+        return [_diagnostic_value(item, depth + 1) for item in value[:10]]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _format_error_detail(detail: Any) -> str:
+    if isinstance(detail, dict):
+        message = detail.get("message")
+        if message:
+            detail = message
+        else:
+            detail = json.dumps(_diagnostic_value(detail), sort_keys=True, separators=(",", ":"))
+    elif not isinstance(detail, (str, int, float, bool)):
+        detail = json.dumps(_diagnostic_value(detail), sort_keys=True, separators=(",", ":"))
+    return _diagnostic_preview(str(detail))
+
+
+def _safe_error_detail(raw: bytes) -> str:
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return _diagnostic_preview(raw.decode("utf-8", errors="replace"))
+    if isinstance(payload, dict):
+        detail = payload.get("error") or payload.get("message")
+        if detail is not None:
+            return _format_error_detail(detail)
+        keys = ", ".join(sorted(str(key) for key in payload.keys()))
+        return f"response fields: {keys or 'none'}"
+    return _format_error_detail(payload)
+
+
 def _send_request(req: request.Request, *, timeout: int) -> Dict[str, Any]:
     try:
         with request.urlopen(req, timeout=timeout) as response:
             raw = response.read()
     except error.HTTPError as exc:
         raw = exc.read()
-        detail = raw.decode("utf-8", errors="replace")[:4000]
+        detail = _safe_error_detail(raw)
         raise ImageGenError(
             f"HTTP {exc.code} from image endpoint: {detail}.{_troubleshooting_hint()}"
         ) from exc
@@ -446,10 +712,10 @@ def _send_request(req: request.Request, *, timeout: int) -> Dict[str, Any]:
 
     try:
         return json.loads(raw.decode("utf-8"))
-    except json.JSONDecodeError as exc:
-        preview = raw[:1000].decode("utf-8", errors="replace")
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        preview = _diagnostic_preview(raw.decode("utf-8", errors="replace"))
         raise ImageGenError(
-            f"Image endpoint returned non-JSON response: {preview}.{_troubleshooting_hint()}"
+            f"Image endpoint returned a non-JSON response: {preview}.{_troubleshooting_hint()}"
         ) from exc
 
 
@@ -509,15 +775,16 @@ def _multipart_body(boundary: str, fields: Dict[str, Any], files: Sequence[Tuple
 
 def _response_to_image_bytes(response: Dict[str, Any]) -> List[bytes]:
     if "error" in response:
-        raise ImageGenError(f"Image endpoint error: {response['error']}")
+        raise ImageGenError(f"Image endpoint error: {_format_error_detail(response['error'])}")
     data = response.get("data")
     if not isinstance(data, list) or not data:
-        raise ImageGenError(f"Image endpoint returned no data: {json.dumps(response)[:1000]}")
+        keys = ", ".join(sorted(str(key) for key in response.keys()))
+        raise ImageGenError(f"Image endpoint returned no image data. Response fields: {keys or 'none'}.")
 
     images: List[bytes] = []
     for idx, item in enumerate(data, start=1):
         if not isinstance(item, dict):
-            raise ImageGenError(f"Unexpected data item {idx}: {item!r}")
+            raise ImageGenError(f"Unexpected image data item {idx}.")
         if item.get("b64_json"):
             try:
                 images.append(base64.b64decode(item["b64_json"]))
@@ -527,7 +794,7 @@ def _response_to_image_bytes(response: Dict[str, Any]) -> List[bytes]:
         if item.get("url"):
             images.append(_fetch_image_url(str(item["url"])))
             continue
-        raise ImageGenError(f"Image {idx} has neither b64_json nor url: {item}")
+        raise ImageGenError(f"Image {idx} has neither b64_json nor url.")
     return images
 
 
@@ -537,7 +804,23 @@ def _fetch_image_url(url: str) -> bytes:
         with request.urlopen(req, timeout=REQUEST_TIMEOUT_SECONDS) as response:
             return response.read()
     except Exception as exc:
-        raise ImageGenError(f"Could not download image URL {url}: {exc}") from exc
+        parsed = urlparse(url)
+        hostname = parsed.hostname or "<host>"
+        if ":" in hostname and not hostname.startswith("["):
+            hostname = f"[{hostname}]"
+        try:
+            port = parsed.port
+        except ValueError:
+            port = None
+        if port is not None:
+            hostname = f"{hostname}:{port}"
+        safe_url = (
+            f"{parsed.scheme}://{hostname}{parsed.path}"
+            if parsed.scheme
+            else "<image URL>"
+        )
+        detail = f"HTTP {exc.code}" if isinstance(exc, error.HTTPError) else type(exc).__name__
+        raise ImageGenError(f"Could not download image URL {safe_url}: {detail}") from exc
 
 
 def _print_request(payload: dict) -> None:
@@ -598,6 +881,12 @@ def _generate(args: argparse.Namespace) -> None:
         )
         return
 
+    _ensure_output_paths_available(
+        output_paths,
+        force=args.force,
+        downscale_max_dim=args.downscale_max_dim,
+        downscale_suffix=args.downscale_suffix,
+    )
     print("Calling image generation endpoint. This can take a couple of minutes.", file=sys.stderr)
     started = time.time()
     response = _json_request(
@@ -611,13 +900,20 @@ def _generate(args: argparse.Namespace) -> None:
     print(f"Generation completed in {elapsed:.1f}s.", file=sys.stderr)
 
     images = _response_to_image_bytes(response)
-    _write_images(
+    saved = _write_images(
         images,
         output_paths,
         force=args.force,
         downscale_max_dim=args.downscale_max_dim,
         downscale_suffix=args.downscale_suffix,
         output_format=output_format,
+    )
+    _print_saved_paths(saved)
+    _print_image_reports(
+        response,
+        saved,
+        requested_model=str(payload["model"]),
+        requested_size=str(payload["size"]),
     )
     _print_revised_prompts(response)
 
@@ -671,6 +967,12 @@ def _edit(args: argparse.Namespace) -> None:
         )
         return
 
+    _ensure_output_paths_available(
+        output_paths,
+        force=args.force,
+        downscale_max_dim=args.downscale_max_dim,
+        downscale_suffix=args.downscale_suffix,
+    )
     print(f"Calling image edit endpoint with {len(image_paths)} image(s).", file=sys.stderr)
     files: List[Tuple[str, Path]] = [("image", p) for p in image_paths]
     if mask_path:
@@ -688,7 +990,7 @@ def _edit(args: argparse.Namespace) -> None:
     print(f"Edit completed in {elapsed:.1f}s.", file=sys.stderr)
 
     images = _response_to_image_bytes(response)
-    _write_images(
+    saved = _write_images(
         images,
         output_paths,
         force=args.force,
@@ -696,16 +998,23 @@ def _edit(args: argparse.Namespace) -> None:
         downscale_suffix=args.downscale_suffix,
         output_format=output_format,
     )
+    _print_saved_paths(saved)
+    _print_image_reports(
+        response,
+        saved,
+        requested_model=str(payload["model"]),
+        requested_size=str(payload["size"]),
+    )
     _print_revised_prompts(response)
 
 
-def _print_revised_prompts(response: Dict[str, Any]) -> None:
+def _print_revised_prompts(response: Dict[str, Any], prefix: str = "") -> None:
     data = response.get("data")
     if not isinstance(data, list):
         return
     for idx, item in enumerate(data, start=1):
         if isinstance(item, dict) and item.get("revised_prompt"):
-            print(f"Revised prompt {idx}: {item['revised_prompt']}", file=sys.stderr)
+            print(f"{prefix}Revised prompt {idx}: {item['revised_prompt']}", file=sys.stderr)
 
 
 def _normalize_job(job: Any, idx: int) -> Dict[str, Any]:
@@ -837,14 +1146,22 @@ def _run_generate_batch(args: argparse.Namespace) -> None:
             )
         return
 
+    for _, _, outputs, _ in prepared:
+        _ensure_output_paths_available(
+            outputs,
+            force=args.force,
+            downscale_max_dim=args.downscale_max_dim,
+            downscale_suffix=args.downscale_suffix,
+        )
+
     any_failed = False
 
-    def run_job(item: Tuple[int, Dict[str, Any], List[Path], str]) -> Tuple[int, Optional[str]]:
+    def run_job(
+        item: Tuple[int, Dict[str, Any], List[Path], str]
+    ) -> Tuple[int, Optional[str], float, Optional[Dict[str, Any]], List[Dict[str, Any]]]:
         i, payload, outputs, output_format = item
-        job_label = f"[job {i}/{len(prepared)}]"
+        started = time.time()
         try:
-            print(f"{job_label} starting", file=sys.stderr)
-            started = time.time()
             response = _json_request(
                 base_url=args.base_url,
                 api_key=args.api_key,
@@ -853,9 +1170,8 @@ def _run_generate_batch(args: argparse.Namespace) -> None:
                 timeout=args.timeout,
             )
             elapsed = time.time() - started
-            print(f"{job_label} completed in {elapsed:.1f}s", file=sys.stderr)
             images = _response_to_image_bytes(response)
-            _write_images(
+            saved = _write_images(
                 images,
                 outputs,
                 force=args.force,
@@ -863,20 +1179,32 @@ def _run_generate_batch(args: argparse.Namespace) -> None:
                 downscale_suffix=args.downscale_suffix,
                 output_format=output_format,
             )
-            _print_revised_prompts(response)
-            return i, None
+            response = _compact_response_for_reporting(response)
+            return i, None, elapsed, response, saved
         except Exception as exc:
-            print(f"{job_label} failed: {exc}", file=sys.stderr)
             if args.fail_fast:
                 raise
-            return i, str(exc)
+            return i, str(exc), time.time() - started, None, []
 
     with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
         futures = [pool.submit(run_job, item) for item in prepared]
         for fut in futures:
-            _, err = fut.result()
+            i, err, elapsed, response, saved = fut.result()
+            job_label = f"[job {i}/{len(prepared)}]"
             if err:
+                print(f"{job_label} failed: {err}", file=sys.stderr)
                 any_failed = True
+                continue
+            print(f"{job_label} completed in {elapsed:.1f}s", file=sys.stderr)
+            _print_saved_paths(saved)
+            _print_image_reports(
+                response or {},
+                saved,
+                requested_model=str(prepared[i - 1][1]["model"]),
+                requested_size=str(prepared[i - 1][1]["size"]),
+                prefix=f"{job_label} ",
+            )
+            _print_revised_prompts(response or {}, prefix=f"{job_label} ")
 
     if any_failed:
         raise SystemExit(1)

@@ -5,7 +5,7 @@ Read this file only when setup, endpoint, auth, output paths, or API compatibili
 ## Defaults
 
 - Endpoint: `http://localhost:8317/v1`
-- Model: `gpt-image-2`
+- Model: `gpt-image-2.5-flare`
 - Local auth: `Authorization: Bearer dummy`
 - Preview output root: `~/.pi/generated_images`
 
@@ -36,17 +36,42 @@ Output directory:
 
 Pi documents `PI_CODING_AGENT_DIR` as the config-dir override. Default Pi config dir is `~/.pi/agent`, so the default generated-image root is `~/.pi/generated_images`.
 
-## Expected proxy API
+## Direct upstream or generic proxy
 
-The local proxy should expose:
+Set `PI_IMAGEGEN_BASE_URL` to the base URL for the service that owns the image routes. The client does not add a provider-specific route.
+
+For a direct upstream service, use its documented base URL and API key:
+
+```bash
+export PI_IMAGEGEN_BASE_URL='https://api.openai.com/v1'
+export PI_IMAGEGEN_API_KEY='set-this-in-your-shell'
+```
+
+For a generic local or remote proxy, use the proxy base URL and the token that it accepts:
+
+```bash
+export PI_IMAGEGEN_BASE_URL='http://localhost:8317/v1'
+export PI_IMAGEGEN_API_KEY='dummy'
+```
+
+The CLI sends one bearer token. Subscription OAuth login and API-key access are different authentication paths. A subscription login does not provide universal API entitlement.
+
+The client does not require model discovery, and it does not retry with another model or billing path after a backend error. The `models` command is optional.
+
+If you use CLIProxyAPI, version `v7.2.156` or newer is a troubleshooting baseline. This skill has no CLIProxyAPI-specific routing or model allowlist.
+
+On September 12, 2026, local CLIProxyAPI `v7.2.158` tests used Codex OAuth with three requested model IDs: `gpt-image-2.5-flare`, `gpt-image-2.5-sunburst`, and `gpt-image-2.5`. Each request returned an image. The responses omitted an actual model field, and all images carried C2PA version 2.0 metadata. These results are not definitive proof of the actual served model or of selectable variants.
+
+## Expected image API
+
+For generation and edit, the configured endpoint should expose:
 
 ```text
-GET  /v1/models
 POST /v1/images/generations
 POST /v1/images/edits
 ```
 
-Health check:
+Optional discovery:
 
 ```bash
 python "$PI_SKILL_DIR/scripts/image_gen.py" models
@@ -60,7 +85,7 @@ curl -sS \
   -H 'Authorization: Bearer dummy' \
   -H 'Content-Type: application/json' \
   http://localhost:8317/v1/images/generations \
-  -d '{"model":"gpt-image-2","prompt":"A tiny red cube on a plain white background, no text","n":1,"size":"1024x1024","quality":"auto","output_format":"png"}' \
+  -d '{"model":"gpt-image-2.5-flare","prompt":"A tiny red cube on a plain white background, no text","n":1,"size":"1024x1024","quality":"auto","output_format":"png"}' \
   -o /tmp/pi-imagegen-test/response.json
 python - <<'PY'
 import base64, json, pathlib
@@ -78,7 +103,7 @@ Direct curl edit test:
 ```bash
 curl -sS \
   -H 'Authorization: Bearer dummy' \
-  -F model=gpt-image-2 \
+  -F model=gpt-image-2.5-flare \
   -F 'prompt=Replace only the background with a clean white studio backdrop; keep the subject unchanged' \
   -F n=1 \
   -F size=1024x1024 \
@@ -90,7 +115,7 @@ curl -sS \
 
 ## Common failures
 
-- `Could not reach image endpoint`: proxy is not running, `--base-url` is wrong, or networking is blocked.
+- `Could not reach image endpoint`: the service is not running, `--base-url` is wrong, or networking is blocked.
 - `HTTP 401/403`: set `PI_IMAGEGEN_API_KEY` or `OPENAI_API_KEY`, or confirm the proxy accepts `dummy`.
 - `Output already exists`: choose a new output path or intentionally pass `--force`.
 - `transparent background requires output-format png or webp`: switch output format.
@@ -101,7 +126,7 @@ curl -sS \
 
 ```bash
 export PI_IMAGEGEN_BASE_URL=http://localhost:8317/v1
-export PI_IMAGEGEN_MODEL=gpt-image-2
+export PI_IMAGEGEN_MODEL=gpt-image-2.5-flare
 export PI_IMAGEGEN_API_KEY=dummy
 export PI_IMAGEGEN_OUTPUT_DIR="$HOME/.pi/generated_images"
 ```
