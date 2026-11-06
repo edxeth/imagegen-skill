@@ -52,10 +52,10 @@ Source: OpenAI Image API reference, image-generation guide, image-prompting guid
 - `input_fidelity`: only for the deprecated 1.x models (`gpt-image-1.5`: `low` or `high`; `gpt-image-1-mini`: `low` only). Omit it for GPT Image 2 and newer: they always process input images at high fidelity, which can raise input-token cost.
 
 ## Output
-- `data[]` list with `b64_json` per image (for SVG, base64 of UTF-8 XML)
+- `data[]` list with `b64_json` per image (for SVG, base64 of UTF-8 XML). Some OpenAI-compatible endpoints return a temporary `url` instead.
 - Streams emit `image_generation.partial_image` / `image_generation.completed` events (`image_edit.*` for edits).
 - Responses and completed events also report `size`, `quality`, `background`, `output_format`, and token `usage` (plus `svg_usage` for the SVG author model). These response fields are optional. The CLI prints the ones present on a `Result:` line.
-- The bundled `scripts/image_gen.py` CLI decodes `b64_json` and writes output files for you.
+- The bundled `scripts/image_gen.py` CLI decodes `b64_json` or downloads `url` (http or https, also after redirects, and without the API key) and writes output files for you.
 
 ## Limits and notes
 - Input images, masks, and markup must be under 50MB.

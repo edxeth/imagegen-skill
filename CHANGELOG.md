@@ -7,7 +7,6 @@
 - The skill files moved from `imagegen/` to the repository root, and skills CLI 1.5 installs only `SKILL.md` from this layout. Reinstall with skills CLI 1.7 or newer: `npx skills add edxeth/imagegen-skill --skill imagegen --agent pi --global --yes`. See [Install](README.md#install).
 - Without `--out` or `--out-dir`, `generate` and `edit` now write to `output/imagegen/output.png` in the current folder, and `generate-batch` now needs `--out-dir`. Version 1 wrote new timestamped files to `PI_IMAGEGEN_OUTPUT_DIR` or `~/.pi/generated_images`. Pass `--out` with a new file name for each image; the CLI replaces an existing file only with `--force`.
 - Model names must now start with `gpt-image-`. Version 1 accepted any model name, including provider aliases. If you used another name, set a GPT Image model that your endpoint offers in `--model`, `IMAGE_GEN_MODEL`, or the `model` of a batch job.
-- The CLI now reads images only from base64 data (`b64_json`) in the response. Version 1 also downloaded images from `url`, so endpoints that return only image URLs no longer work. Configure the endpoint to return base64 data, or use another endpoint.
 - The CLI no longer expands `~` in file and folder paths, including `out` values in batch jobs. A quoted path such as `--out '~/image.png'` now writes to a folder named `~` in the current folder, and input paths in that form are not found. Use an absolute path or `$HOME`, for example `--out "$HOME/image.png"`.
 - Removed the `models` subcommand, which listed the models of an endpoint. Query the endpoint's `/models` route instead.
 - Removed `--timeout`; remove it from saved commands. Requests now use the defaults of the `openai` package: a 600-second timeout and up to 2 automatic retries. Version 1 waited 300 seconds and did not retry.
@@ -58,6 +57,7 @@ Update saved commands and batch jobs to use values that the selected model accep
 - Changed the default `generate-batch` concurrency from 3 to 5.
 - Changed the report after each call to a `Result:` line with the size, quality, background, output format, and token usage that the API reports. Version 1 reported the requested and returned model and size, and the measured size of each file.
 - Changed the setup: the skill no longer needs the `pi-better-skills` extension, because the instructions no longer use `$PI_SKILL_DIR`.
+- Changed the download of images that the API returns as a URL: the CLI now opens only `http` and `https` URLs, also after redirects. Version 1 also opened other URL types, such as `file:` URLs.
 
 #### Agent instructions follow OpenAI's imagegen skill
 Refs: `7ed40db`
@@ -70,7 +70,7 @@ The instructions are now based on OpenAI's imagegen skill and adapted for pi.
 ### Fixed
 
 - Fixed `--dry-run` and batches rejected by validation creating empty output folders. The CLI now creates a folder only when it writes a file.
-- Fixed files that got the requested extension when the API returned another format, for example PNG data in a `.webp` file. The file now gets the extension of the returned format, and the CLI prints a warning with the path.
+- Fixed files that got the requested extension when the API returned another format, for example PNG data in a `.webp` file. The file now gets the extension of the returned format, and the CLI prints a warning with the path. If a file with that name exists, the CLI writes a numbered copy such as `pic-2.png` instead.
 - Fixed `--downscale-max-dim` stopping with a Pillow error after the paid request when Pillow was not installed. The CLI now checks for Pillow before it sends a request.
 
 ### Removed

@@ -10,12 +10,15 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import http.client
 import json
 import os
 from pathlib import Path
 import re
 import sys
 import time
+import urllib.error
+import urllib.request
 from urllib.parse import urlsplit
 from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Tuple
 
@@ -72,6 +75,11 @@ OUTPUT_COMPRESSION_RANGE = (0, 100)
 MAX_SAFETY_IDENTIFIER_CHARS = 128
 # Longest server error text the CLI prints for a failed API call.
 MAX_ERROR_DETAIL_CHARS = 600
+# Some OpenAI-compatible endpoints return a result image as a URL. v1.0.0 allowed the same time
+# to download it.
+IMAGE_DOWNLOAD_TIMEOUT_SECONDS = 300
+# URL schemes of result images the CLI downloads. Other schemes, such as file:, could read local files.
+IMAGE_URL_SCHEMES = {"http", "https"}
 # File extension for each output format the API can return.
 FORMAT_EXTENSIONS = {"png": ".png", "jpeg": ".jpeg", "webp": ".webp", "gif": ".gif", "svg": ".svg"}
 # --alpha-snap raises alpha values from this one up to 254 to 255. Transparent logos from an
@@ -89,6 +97,10 @@ def _die(message: str, code: int = 1) -> None:
 
 def _warn(message: str) -> None:
     print(f"Warning: {message}", file=sys.stderr)
+
+
+class ImageResultError(Exception):
+    """The API answered, but its response holds no image that the CLI can save."""
 
 
 def _dependency_hint(package: str, *, upgrade: bool = False) -> str:
@@ -476,20 +488,74 @@ def _write_image(raw: bytes, out_path: Path, *, force: bool, expected_format: st
     actual_format = _detect_image_format(raw) or expected_format
     if actual_format != expected_format:
         out_path = out_path.with_suffix(FORMAT_EXTENSIONS[actual_format])
-    if out_path.exists() and not force:
-        _die(f"Output already exists: {out_path} (use --force to overwrite)")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_bytes(raw)
-    print(f"Wrote {out_path}")
+    written = _write_file(raw, out_path, force=force)
     if actual_format != expected_format:
-        _warn(f"requested {expected_format} output, but the API returned {actual_format} data; wrote {out_path}.")
-    return out_path, actual_format
+        _warn(f"requested {expected_format} output, but the API returned {actual_format} data; wrote {written}.")
+    return written, actual_format
+
+
+def _write_file(data: bytes, path: Path, *, force: bool) -> Path:
+    """Write data to path, or to a free numbered sibling of it, and return the path written.
+
+    Existing outputs are checked before the request (_ensure_output_paths_available). A conflict
+    here comes from a name known only after the request, such as the extension of the returned
+    format, or from a file created meanwhile. Without --force the file then goes to
+    <stem>-2<suffix>, <stem>-3<suffix>, and so on, so a paid image is never discarded. Each
+    attempt creates the file exclusively, so a file that appears after any check is not replaced.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    target = path
+    if force:
+        target.write_bytes(data)
+    else:
+        number = 2
+        while True:
+            try:
+                with open(target, "xb") as handle:
+                    handle.write(data)
+                break
+            except FileExistsError:
+                target = path.with_name(f"{path.stem}-{number}{path.suffix}")
+                number += 1
+    print(f"Wrote {target}")
+    if target != path:
+        _warn(f"{path} already exists, so the image was written to {target} instead.")
+    return target
 
 
 def _derive_downscale_path(path: Path, suffix: str) -> Path:
     if suffix and not suffix.startswith("-") and not suffix.startswith("_"):
         suffix = "-" + suffix
     return path.with_name(f"{path.stem}{suffix}{path.suffix}")
+
+
+def _partial_image_path(output_path: Path, index: int) -> Path:
+    """Return where a stream saves its partial image <index>: <stem>-partial-<index><suffix>."""
+    return output_path.with_name(f"{output_path.stem}-partial-{index}{output_path.suffix}")
+
+
+def _ensure_output_paths_available(
+    outputs: List[Path],
+    *,
+    force: bool,
+    downscale_max_dim: Optional[int],
+    downscale_suffix: str,
+    partial_images: int = 0,
+) -> None:
+    """Stop before the request when a file that the run writes already exists.
+
+    The request is paid, so a conflict found after it would discard the image. The check covers
+    the outputs, their downscaled copies, and the partial images of a stream.
+    """
+    if force:
+        return
+    candidates = list(outputs)
+    if downscale_max_dim is not None:
+        candidates.extend(_derive_downscale_path(path, downscale_suffix) for path in outputs)
+    candidates.extend(_partial_image_path(outputs[0], index) for index in range(partial_images))
+    for path in candidates:
+        if path.exists():
+            _die(f"Output already exists: {path} (use --force to overwrite)")
 
 
 def _import_pillow(feature: str) -> Any:
@@ -580,8 +646,8 @@ def _downscale_image_bytes(image_bytes: bytes, *, max_dim: int, output_format: s
         return out.getvalue()
 
 
-def _decode_write_and_downscale(
-    images: List[str],
+def _write_and_downscale(
+    images: List[bytes],
     outputs: List[Path],
     *,
     force: bool,
@@ -590,10 +656,9 @@ def _decode_write_and_downscale(
     output_format: str,
     alpha_snap: bool,
 ) -> None:
-    for idx, image_b64 in enumerate(images):
+    for idx, raw in enumerate(images):
         if idx >= len(outputs):
             break
-        raw = base64.b64decode(image_b64)
         if alpha_snap:
             raw = _apply_alpha_snap(raw)
         out_path, actual_format = _write_image(raw, outputs[idx], force=force, expected_format=output_format)
@@ -601,13 +666,8 @@ def _decode_write_and_downscale(
         if downscale_max_dim is None:
             continue
 
-        derived = _derive_downscale_path(out_path, downscale_suffix)
-        if derived.exists() and not force:
-            _die(f"Output already exists: {derived} (use --force to overwrite)")
-        derived.parent.mkdir(parents=True, exist_ok=True)
         resized = _downscale_image_bytes(raw, max_dim=downscale_max_dim, output_format=actual_format)
-        derived.write_bytes(resized)
-        print(f"Wrote {derived}")
+        _write_file(resized, _derive_downscale_path(out_path, downscale_suffix), force=force)
 
 
 def _consume_image_stream(
@@ -623,11 +683,11 @@ def _consume_image_stream(
     for event in events:
         event_type = str(getattr(event, "type", ""))
         if event_type.endswith(".partial_image"):
-            partial_path = output_path.with_name(
-                f"{output_path.stem}-partial-{event.partial_image_index}{output_path.suffix}"
-            )
             _write_image(
-                base64.b64decode(event.b64_json), partial_path, force=force, expected_format=output_format
+                base64.b64decode(event.b64_json),
+                _partial_image_path(output_path, event.partial_image_index),
+                force=force,
+                expected_format=output_format,
             )
             partial_count += 1
         elif event_type.endswith(".completed"):
@@ -670,19 +730,82 @@ def _collect_result(
     *,
     force: bool,
     label: str,
-) -> List[str]:
-    """Return the final images as base64; print the reported settings and any ignored ones."""
+) -> List[bytes]:
+    """Return the bytes of the final images; print the reported settings and any ignored ones."""
     if payload.get("stream"):
         completed, partial_count = _consume_image_stream(
             result, first_output, force=force, output_format=payload["output_format"]
         )
         _report_result_metadata(completed, label)
         _warn_on_ignored_settings(payload, completed, image_count=1, partial_count=partial_count, label=label)
-        return [completed.b64_json]
-    images = [item.b64_json for item in result.data]
+        return [_image_bytes(completed, 1)]
+    data = result.data or []
     _report_result_metadata(result, label)
-    _warn_on_ignored_settings(payload, result, image_count=len(images), partial_count=None, label=label)
-    return images
+    _warn_on_ignored_settings(payload, result, image_count=len(data), partial_count=None, label=label)
+    if not data:
+        raise ImageResultError("the response has no image data")
+    return [_image_bytes(item, index) for index, item in enumerate(data, start=1)]
+
+
+def _image_bytes(item: Any, index: int) -> bytes:
+    """Return the bytes of one result image from its base64 data or, without it, from its URL.
+
+    GPT Image models answer with b64_json. Some OpenAI-compatible endpoints answer with a
+    temporary URL instead.
+    """
+    b64_json = getattr(item, "b64_json", None)
+    if b64_json:
+        return base64.b64decode(b64_json)
+    url = getattr(item, "url", None)
+    if url:
+        return _download_image(str(url), index)
+    raise ImageResultError(f"image {index} in the response has no b64_json or url")
+
+
+class _ImageRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follow a redirect of a result image URL only to an http or https URL.
+
+    urllib's default handler also follows redirects to ftp: URLs.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        scheme = urlsplit(newurl).scheme
+        if scheme not in IMAGE_URL_SCHEMES:
+            fp.close()
+            raise urllib.error.URLError(f"redirect to a {scheme!r} URL is not allowed")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _download_image(url: str, index: int) -> bytes:
+    """Download a result image that the API returned as a URL.
+
+    Only http and https URLs are opened, also after redirects. The request carries no API key,
+    because the URL can point to another host than OPENAI_BASE_URL. Messages show the URL
+    through _safe_url, because the query string of such URLs often holds a signature.
+    """
+    try:
+        where = _safe_url(url)  # raises ValueError for a malformed host or port
+    except ValueError:
+        raise ImageResultError(f"image {index} has a malformed URL") from None
+    scheme = urlsplit(url).scheme
+    if scheme not in IMAGE_URL_SCHEMES:
+        raise ImageResultError(f"image {index} URL scheme {scheme!r} is not http or https")
+    request = urllib.request.Request(url, headers={"Accept": "image/*,*/*"})
+    try:
+        opener = urllib.request.build_opener(_ImageRedirectHandler)
+        with opener.open(request, timeout=IMAGE_DOWNLOAD_TIMEOUT_SECONDS) as response:
+            return response.read()
+    except (OSError, http.client.HTTPException, ValueError) as exc:
+        # HTTPError and URLError are OSErrors. Other exception texts can quote the URL, so only
+        # their type is shown.
+        if isinstance(exc, urllib.error.HTTPError):
+            detail = f"HTTP {exc.code}"
+            exc.close()  # an HTTPError holds the open error response
+        elif isinstance(exc, urllib.error.URLError):
+            detail = _one_line(str(exc.reason))
+        else:
+            detail = type(exc).__name__
+        raise ImageResultError(f"could not download image {index} from {where}: {detail}") from exc
 
 
 def _warn_on_ignored_settings(
@@ -769,7 +892,9 @@ def _safe_url(url: Any) -> str:
 
 
 def _describe_api_error(operation: str, exc: BaseException) -> Optional[str]:
-    """Return one line describing an OpenAI SDK error, or None for any other exception."""
+    """Return one line describing an OpenAI SDK error or an unusable response, or None otherwise."""
+    if isinstance(exc, ImageResultError):
+        return f"{operation} failed: {exc}."
     try:
         import openai
     except ImportError:
@@ -1075,7 +1200,7 @@ async def _run_generate_batch(args: argparse.Namespace, prepared: List[_BatchJob
             images = _collect_result(
                 result, job.payload, job.outputs[0], force=args.force, label=f"{job_label} result"
             )
-            _decode_write_and_downscale(
+            _write_and_downscale(
                 images,
                 job.outputs,
                 force=args.force,
@@ -1111,6 +1236,13 @@ def _generate_batch(args: argparse.Namespace) -> None:
     if args.dry_run:
         _print_batch_requests(prepared, args)
         return
+    for job in prepared:
+        _ensure_output_paths_available(
+            job.outputs,
+            force=args.force,
+            downscale_max_dim=args.downscale_max_dim,
+            downscale_suffix=args.downscale_suffix,
+        )
     try:
         exit_code = asyncio.run(_run_generate_batch(args, prepared))
     except Exception as exc:
@@ -1169,6 +1301,13 @@ def _generate(args: argparse.Namespace) -> None:
         )
         return
 
+    _ensure_output_paths_available(
+        output_paths,
+        force=args.force,
+        downscale_max_dim=args.downscale_max_dim,
+        downscale_suffix=args.downscale_suffix,
+        partial_images=payload.get("partial_images", 0),
+    )
     print(
         "Calling Image API (generation). This can take up to a couple of minutes.",
         file=sys.stderr,
@@ -1186,7 +1325,7 @@ def _generate(args: argparse.Namespace) -> None:
     elapsed = time.time() - started
     print(f"Generation completed in {elapsed:.1f}s.", file=sys.stderr)
 
-    _decode_write_and_downscale(
+    _write_and_downscale(
         images,
         output_paths,
         force=args.force,
@@ -1271,6 +1410,13 @@ def _edit(args: argparse.Namespace) -> None:
         )
         return
 
+    _ensure_output_paths_available(
+        output_paths,
+        force=args.force,
+        downscale_max_dim=args.downscale_max_dim,
+        downscale_suffix=args.downscale_suffix,
+        partial_images=payload.get("partial_images", 0),
+    )
     print(
         f"Calling Image API (edit) with {len(image_paths)} image(s).",
         file=sys.stderr,
@@ -1298,7 +1444,7 @@ def _edit(args: argparse.Namespace) -> None:
 
     elapsed = time.time() - started
     print(f"Edit completed in {elapsed:.1f}s.", file=sys.stderr)
-    _decode_write_and_downscale(
+    _write_and_downscale(
         images,
         output_paths,
         force=args.force,

@@ -98,10 +98,10 @@ python "$IMAGE_GEN" generate \
 ## Output handling
 - Use `tmp/imagegen/` for temporary JSONL inputs or scratch files.
 - Use `output/imagegen/` for final outputs.
-- Reruns fail if a target file already exists unless you pass `--force`.
+- If an output file, its downscaled copy, or a partial image already exists, the CLI stops before it sends the request. `--force` replaces them.
 - After each call the CLI prints a `Result:` line (`[job N/M] result:` in batch mode) with the size, quality, background, and output format the API reports, plus token usage. Use it to see what `auto` resolved to and what the call cost in tokens.
 - When the result differs from the request, the CLI prints `Warning: ... differs from the request:` with each difference: size or quality (when not `auto`), background, fewer images than `--n`, or no partial images while streaming. Some proxies and backends ignore these settings.
-- When the API returns another file format than requested (for example PNG for `--output-format svg`), the CLI writes the file with the real format's extension and prints a warning with the path it wrote.
+- When the API returns another file format than requested (for example PNG for `--output-format svg`), the CLI writes the file with the real format's extension and prints a warning with the path it wrote. If a file with that name exists, it writes a numbered copy such as `logo-2.png` instead.
 - `--alpha-snap` (png or webp output): after download, the CLI sets pixels with alpha 250-254 to fully opaque and prints how many it changed. Use it for transparent logos and icons whose solid areas come back slightly see-through. It re-encodes the file (WebP losslessly) and needs Pillow.
 - A failed API call prints one `Error:` line with the HTTP status, the request URL, and the server's message, then exits with status 1. In batch mode the job's `failed:` line has the same text, and the other jobs continue.
 - `--out-dir` changes one-off naming to `image_1.<ext>`, `image_2.<ext>`, and so on.

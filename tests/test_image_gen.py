@@ -20,14 +20,17 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import http.server
 import importlib.util
 import io
 import json
 import os
 from pathlib import Path
+import socketserver
 import subprocess
 import sys
 import tempfile
+import threading
 import types
 from types import SimpleNamespace
 import unittest
@@ -684,6 +687,75 @@ def _usage(input_tokens: int, output_tokens: int) -> SimpleNamespace:
     )
 
 
+@contextlib.contextmanager
+def _image_url_server(files: dict, redirects: dict | None = None):
+    """Serve files at http://127.0.0.1:<port>/<name>, like the temporary image URLs some endpoints return.
+
+    redirects maps a name to the Location of a 302 answer; "{base}" in it becomes the server's URL.
+    Yields the base URL and a list with the headers of every request the server received.
+    """
+    requests: list = []
+    redirects = redirects or {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            requests.append(dict(self.headers))
+            name = self.path.split("?", 1)[0].lstrip("/")
+            if name in redirects:
+                self.send_response(302)
+                self.send_header("Location", redirects[name].format(base=base))
+                self.end_headers()
+                return
+            body = files.get(name)
+            if body is None:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args) -> None:
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        # A proxy from the developer's environment must not intercept the loopback requests.
+        with mock.patch.dict(os.environ, {"no_proxy": "127.0.0.1", "NO_PROXY": "127.0.0.1"}):
+            yield base, requests
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@contextlib.contextmanager
+def _ftp_probe():
+    """Listen on a loopback port like an FTP server and record every connection.
+
+    It answers each connection with an FTP error at once, so a client that connects fails fast.
+    Yields the port and the list of recorded connections.
+    """
+    connections: list = []
+
+    class Handler(socketserver.BaseRequestHandler):
+        def handle(self) -> None:
+            connections.append(self.client_address)
+            self.request.sendall(b"500 probe rejects every connection\r\n")
+
+    server = socketserver.TCPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server.server_address[1], connections
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 class ExecutionTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -1172,6 +1244,168 @@ class ExecutionTests(unittest.TestCase):
                 self.assertIn(message, self.stderr)
                 self.assertEqual(async_images.calls, [])
                 self.assertNotIn("Traceback", self.stderr)
+
+    # -- Existing outputs. v1.0.0 checked them before any request (tag v1.0.0,
+    # _ensure_output_paths_available), so a rerun never paid for an image it could not save.
+
+    def test_existing_output_stops_before_any_request(self) -> None:
+        image = self.tmp / "input.png"
+        image.write_bytes(PNG_BYTES)
+        jobs = self.tmp / "jobs.jsonl"
+        jobs.write_text(
+            "\n".join([json.dumps({"prompt": "a", "out": "a.png"}), json.dumps({"prompt": "b", "out": "b.png"})]),
+            encoding="utf-8",
+        )
+        stream = iter([
+            SimpleNamespace(type="image_generation.partial_image", partial_image_index=0, b64_json=_b64(b"p0")),
+            SimpleNamespace(type="image_generation.partial_image", partial_image_index=1, b64_json=_b64(b"p1")),
+            SimpleNamespace(type="image_generation.completed", b64_json=_b64(PNG_BYTES)),
+        ])
+        runs = {
+            "generate": ("g.png", None, ["generate", "--prompt", "x", "--out", str(self.tmp / "g.png")]),
+            "edit": ("e.png", None, ["edit", "--image", str(image), "--prompt", "x", "--out", str(self.tmp / "e.png")]),
+            "downscaled copy": ("d-web.png", None, ["generate", "--prompt", "x", "--downscale-max-dim", "64",
+                                                    "--out", str(self.tmp / "d.png")]),
+            "partial image": ("s-partial-1.png", stream, ["generate", "--prompt", "x", "--stream", "--partial-images",
+                                                          "2", "--out", str(self.tmp / "s.png")]),
+            "second batch job": ("batch/b.png", None, ["generate-batch", "--input", str(jobs), "--out-dir",
+                                                       str(self.tmp / "batch"), "--no-augment"]),
+        }
+        for label, (existing_name, stream_response, argv) in runs.items():
+            with self.subTest(run=label):
+                existing = self.tmp / existing_name
+                existing.parent.mkdir(parents=True, exist_ok=True)
+                existing.write_bytes(b"keep")
+                response = SimpleNamespace(data=[SimpleNamespace(b64_json=_b64(PNG_BYTES))])
+                async_images = FakeAsyncImages({"a": response, "b": response})
+                with self.assertRaises(SystemExit) as ctx:
+                    self.run_main(
+                        {"generate": stream_response or response, "edit": response}, *argv,
+                        async_client=SimpleNamespace(images=async_images),
+                    )
+                self.assertEqual(ctx.exception.code, 1)
+                self.assertIn(f"Error: Output already exists: {existing} (use --force to overwrite)", self.stderr)
+                self.assertEqual(self.fake_images.calls, [])
+                self.assertEqual(async_images.calls, [])
+                self.assertEqual(existing.read_bytes(), b"keep")
+
+    def test_force_replaces_existing_output(self) -> None:
+        out = self.tmp / "g.png"
+        out.write_bytes(b"old")
+        response = SimpleNamespace(data=[SimpleNamespace(b64_json=_b64(PNG_BYTES))])
+        images = self.run_main({"generate": response}, "generate", "--prompt", "x", "--force", "--out", str(out))
+        self.assertEqual(len(images.calls), 1)
+        self.assertEqual(out.read_bytes(), PNG_BYTES)
+
+    def test_image_is_kept_when_its_real_extension_is_taken(self) -> None:
+        # The returned format is known only after the request, so this conflict cannot be found
+        # before it. The paid image goes to a numbered sibling instead of being discarded.
+        taken = self.tmp / "hero.png"
+        taken.write_bytes(b"keep")
+        response = SimpleNamespace(data=[SimpleNamespace(b64_json=_b64(PNG_BYTES))])
+        self.run_main(
+            {"generate": response}, "generate", "--prompt", "x", "--output-format", "jpeg",
+            "--out", str(self.tmp / "hero.jpeg"),
+        )
+        kept = self.tmp / "hero-2.png"
+        self.assertEqual(taken.read_bytes(), b"keep")
+        self.assertEqual(kept.read_bytes(), PNG_BYTES)
+        self.assertIn(f"Warning: {taken} already exists, so the image was written to {kept} instead.", self.stderr)
+
+    def test_file_that_appears_after_the_checks_is_not_overwritten(self) -> None:
+        # Another process can create the output between the last check and the write. Path.exists
+        # answers as it did before the file appeared, so only an exclusive create can notice it.
+        out = self.tmp / "race.png"
+        out.write_bytes(b"other process")
+        real_exists = Path.exists
+
+        def exists_before_the_file_appeared(path, *args, **kwargs):
+            return False if path == out else real_exists(path, *args, **kwargs)
+
+        response = SimpleNamespace(data=[SimpleNamespace(b64_json=_b64(PNG_BYTES))])
+        with mock.patch.object(Path, "exists", exists_before_the_file_appeared):
+            self.run_main({"generate": response}, "generate", "--prompt", "x", "--out", str(out))
+        self.assertEqual(out.read_bytes(), b"other process")
+        self.assertEqual((self.tmp / "race-2.png").read_bytes(), PNG_BYTES)
+
+    # -- Image URLs. Some OpenAI-compatible endpoints answer with data[].url instead of b64_json;
+    # v1.0.0 downloaded them (tag v1.0.0, _fetch_image_url).
+
+    def test_image_url_result_is_downloaded_without_the_api_key(self) -> None:
+        with _image_url_server({"image.png": PNG_BYTES}, redirects={"moved.png": "{base}/image.png"}) as (
+            base, requests,
+        ):
+            for name, request_count in (("image.png", 1), ("moved.png", 2)):
+                with self.subTest(url=name):
+                    requests.clear()
+                    out = self.tmp / f"from-{name}"
+                    response = SimpleNamespace(data=[SimpleNamespace(b64_json=None, url=f"{base}/{name}?sig=secret")])
+                    self.run_main({"generate": response}, "generate", "--prompt", "x", "--out", str(out))
+                    self.assertEqual(out.read_bytes(), PNG_BYTES)
+                    self.assertEqual(len(requests), request_count)
+                    for headers in requests:
+                        self.assertNotIn("authorization", {header.lower() for header in headers})
+
+    def test_unusable_image_result_is_one_error_line(self) -> None:
+        with _ftp_probe() as (ftp_port, ftp_connections), _image_url_server(
+            {}, redirects={"to-ftp.png": f"ftp://127.0.0.1:{ftp_port}/x.png"}
+        ) as (base, _requests):
+            cases = {
+                "no image data": (SimpleNamespace(data=[]), "the response has no image data"),
+                "no b64_json or url": (
+                    SimpleNamespace(data=[SimpleNamespace(b64_json=None, url=None)]),
+                    "image 1 in the response has no b64_json or url",
+                ),
+                "download fails": (
+                    SimpleNamespace(data=[SimpleNamespace(b64_json=None, url=f"{base}/gone.png?sig=secret")]),
+                    f"could not download image 1 from {base}/gone.png: HTTP 404",
+                ),
+                "not http": (
+                    SimpleNamespace(data=[SimpleNamespace(b64_json=None, url="file:///etc/hostname")]),
+                    "image 1 URL scheme 'file' is not http or https",
+                ),
+                "malformed URL": (
+                    SimpleNamespace(data=[SimpleNamespace(b64_json=None, url="http://127.0.0.1:port/x.png?sig=secret")]),
+                    "image 1 has a malformed URL",
+                ),
+                "redirect to ftp": (
+                    SimpleNamespace(data=[SimpleNamespace(b64_json=None, url=f"{base}/to-ftp.png?sig=secret")]),
+                    f"could not download image 1 from {base}/to-ftp.png: redirect to a 'ftp' URL is not allowed",
+                ),
+            }
+            for label, (response, detail) in cases.items():
+                with self.subTest(case=label):
+                    out = self.tmp / f"{label.replace(' ', '-')}.png"
+                    with self.assertRaises(SystemExit) as ctx:
+                        self.run_main({"generate": response}, "generate", "--prompt", "x", "--out", str(out))
+                    self.assertEqual(ctx.exception.code, 1)
+                    self.assertIn(f"Error: Image generation failed: {detail}.", self.stderr)
+                    self.assertNotIn("secret", self.stderr)
+                    self.assertNotIn("Traceback", self.stderr)
+                    self.assertFalse(out.exists())
+            self.assertEqual(ftp_connections, [])
+
+    def test_batch_job_with_unusable_image_result_fails_alone(self) -> None:
+        jobs = self.tmp / "jobs.jsonl"
+        jobs.write_text("\n".join([json.dumps({"prompt": "good"}), json.dumps({"prompt": "bad"})]), encoding="utf-8")
+        for extra, expected in (
+            ([], "[job 2/2] failed: Image generation failed: image 1 in the response has no b64_json or url."),
+            (["--fail-fast"], "Error: Batch stopped at the first failed job (--fail-fast)."),
+        ):
+            with self.subTest(extra=extra):
+                async_images = FakeAsyncImages({
+                    "good": SimpleNamespace(data=[SimpleNamespace(b64_json=_b64(PNG_BYTES))]),
+                    "bad": SimpleNamespace(data=[SimpleNamespace(b64_json=None, url=None)]),
+                })
+                with self.assertRaises(SystemExit) as ctx:
+                    self.run_main(
+                        {}, "generate-batch", "--input", str(jobs), "--out-dir", str(self.tmp / "batch"),
+                        "--no-augment", "--force", *extra, async_client=SimpleNamespace(images=async_images),
+                    )
+                self.assertEqual(ctx.exception.code, 1)
+                self.assertIn(expected, self.stderr)
+                self.assertNotIn("Traceback", self.stderr)
+        self.assertEqual((self.tmp / "batch" / "001-good.png").read_bytes(), PNG_BYTES)
 
 
 class HelperTests(unittest.TestCase):
