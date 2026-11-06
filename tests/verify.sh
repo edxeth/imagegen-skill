@@ -16,12 +16,12 @@ git -C "$fixture" config user.email "test@example.com"
 git -C "$fixture" add -A
 git -C "$fixture" commit -qm "fixture"
 
-# Simulate the incomplete installation produced by the root-level SKILL.md layout.
-installed="$test_home/.pi/agent/skills/imagegen"
+# Start from a stale install that the skills CLI must replace with the complete bundle.
+installed="$test_home/.agents/skills/imagegen"
 mkdir -p "$installed"
 printf '%s\n' 'incomplete install' > "$installed/SKILL.md"
 
-HOME="$test_home" npx --yes skills@1.5.17 add "file://$fixture" \
+HOME="$test_home" npx --yes skills@1.7.6 add "file://$fixture" \
   --skill imagegen \
   --agent pi \
   --global \

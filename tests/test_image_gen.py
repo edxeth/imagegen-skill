@@ -1,4 +1,4 @@
-"""Behavior tests for imagegen/scripts/image_gen.py.
+"""Behavior tests for scripts/image_gen.py.
 
 Run from the repository root:  python3 -m unittest discover -s tests -v
 Set IMAGEGEN_SCRIPT to test another copy of the script, for example an installed one.
@@ -34,7 +34,7 @@ import unittest
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = Path(os.environ.get("IMAGEGEN_SCRIPT", ROOT / "imagegen" / "scripts" / "image_gen.py"))
+SCRIPT = Path(os.environ.get("IMAGEGEN_SCRIPT", ROOT / "scripts" / "image_gen.py"))
 
 
 # Variables from the developer's shell that change CLI behavior; tests set them explicitly.
