@@ -30,7 +30,7 @@ HOME="$test_home" npx --yes skills@1.5.17 add "file://$fixture" \
 test -f "$installed/SKILL.md"
 test -f "$installed/scripts/image_gen.py"
 test -f "$installed/references/cli.md"
-test -f "$installed/references/troubleshooting.md"
+test -f "$installed/references/image-api.md"
 
 env \
   -u PI_IMAGEGEN_BASE_URL \
@@ -40,6 +40,7 @@ env \
   -u PI_IMAGEGEN_MODEL \
   -u PI_IMAGEGEN_OUTPUT_DIR \
   -u PI_CODING_AGENT_DIR \
+  -u IMAGE_GEN_MODEL \
   PYTHONPYCACHEPREFIX="$test_home/pycache" python "$installed/scripts/image_gen.py" \
   generate \
   --prompt "A tiny red cube on a white background" \
@@ -67,6 +68,7 @@ env \
   -u PI_IMAGEGEN_OUTPUT_DIR \
   -u PI_CODING_AGENT_DIR \
   -u IMAGEGEN_SCRIPT \
+  -u IMAGE_GEN_MODEL \
   PYTHONPYCACHEPREFIX="$test_home/pycache" \
   python -m unittest discover -s "$repo_root/tests" -v
 

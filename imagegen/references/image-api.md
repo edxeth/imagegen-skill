@@ -1,95 +1,66 @@
-# OpenAI-compatible Image API Notes
+# Image API quick reference
 
-This skill targets OpenAI-compatible image endpoints through `scripts/image_gen.py`. The endpoint can be a direct upstream service or a generic proxy.
+This file is the API parameter reference for the CLI (`scripts/image_gen.py`). Read it when `references/cli.md` does not answer a parameter question.
 
-For generation and edit, the configured endpoint must expose:
+These parameters describe the Image API and the bundled CLI.
 
-```text
-POST /v1/images/generations
-POST /v1/images/edits
-```
+Source: OpenAI Image API reference, image-generation guide, image-prompting guide, and deprecations page on developers.openai.com, checked 2026-11-06.
 
-The optional `models` command uses `GET /v1/models`. Generation and edit do not call this route first.
+## Models
+- `gpt-image-2.6-sunburst` (CLI default unless `IMAGE_GEN_MODEL` is set): detailed visual work and precise edits.
+- `gpt-image-2.6-flare`: fast iteration; use it when the user asks for speed.
+- `gpt-image-2.5-sunburst`, `gpt-image-2.5-flare`, `gpt-image-2`: still available.
+- Deprecated: `gpt-image-1.5` and `gpt-image-1-mini` shut down on 2026-12-01. `gpt-image-1` was shut down on 2026-10-23. The CLI prints a warning when you select one of them.
 
-## Endpoint configuration
+## Endpoints
+- Generate: `POST /v1/images/generations` (`client.images.generate(...)`)
+- Edit: `POST /v1/images/edits` (`client.images.edit(...)`)
 
-Endpoint/auth defaults and precedence live in `references/troubleshooting.md`.
+## Core parameters
+- `prompt`: text prompt, at most 32,000 characters
+- `model`: image model
+- `n`: number of images (1-10)
+- `size`: `auto` or `WIDTHxHEIGHT`; rules and popular sizes are in `references/cli.md` ("Model, quality, and complexity").
+- `quality`: `low`, `medium`, `high`, `xhigh`, `max`, or `auto`. `xhigh` and `max` need GPT Image 2.5 or 2.6. Quality controls rendered detail such as texture and small lettering.
+- `complexity`: `low`, `medium`, or `high`. It controls how much the model plans before it renders, separately from `quality`. GPT Image 2.6 uses `high` when it is omitted. It has no extra fee, but higher values can add latency. To compare complexity levels, keep `quality` fixed.
+- `background`: output transparency behavior (`transparent`, `opaque`, or `auto`) for generated output; this is not the same thing as the prompt's visual scene/backdrop. Transparent output needs `png`, `webp`, or `svg`.
+- `output_format`: `png` (default), `jpeg`, `webp`, `gif`, or `svg` (generate only). `jpeg` is faster than `png`.
+- `output_compression`: 0-100 (jpeg/webp only)
+- `moderation`: `auto` (default) or `low`
+- `safety_identifier`: stable identifier for the end user, at most 128 characters. Hash a username or email address; do not send it in plain text.
+- `stream` and `partial_images` (0-3): stream partial images while the final image renders. Each partial image adds 100 output tokens.
 
-## Parameters
+## GIF output (`output_format=gif`)
+- Works on generate and edit. Use edit to animate from still reference images.
+- `frame_count`: 2-16 (default 9). `frame_duration_ms`: 20-2000 per frame, rounded to 10 ms (default 200).
+- `size` is the size of each frame: `auto` or `WIDTHxHEIGHT` with multiples of 16. Frame count, frame size, and `n` share one request pixel budget; if a request is too large, reduce one of them or use `auto`.
+- Not supported with streaming, partial images, masks, or `output_compression`.
+- Needs access to the GIF preview for the selected model.
+- In the prompt, give the subject a starting pose to return to, and say whether the camera moves.
 
-Common parameters:
+## SVG output (`output_format=svg`)
+- Generate only, with `n=1`. The edit endpoint does not support SVG output or SVG input.
+- The API renders a reference image (controlled by `quality` and `complexity`) and then an author model writes the SVG. The result is static vector content without scripts, external resources, or embedded raster images.
+- Optional `svg` object: `{"model": "<author model>", "reasoning": {"effort": "none|minimal|low|medium|high|xhigh|max"}}`. Send it only when your project has SVG model selection; otherwise omit it.
+- Not supported with streaming, partial images, or `output_compression`.
+- Cost: the image model's rate for the reference image plus the author model's rate for its tokens.
 
-| CLI option | API field | Notes |
-|---|---|---|
-| `--model` | `model` | Default `gpt-image-2.5-flare`. Provider-defined names are accepted. |
-| `--prompt` / `--prompt-file` | `prompt` | Required for generate/edit. |
-| `--n` | `n` | 1-10. |
-| `--size` | `size` | `auto` or positive ASCII `WIDTHxHEIGHT`. The backend enforces size support. |
-| `--quality` | `quality` | `low`, `medium`, `high`, `xhigh`, `max`, or `auto`. The backend enforces quality support. |
-| `--background` | `background` | `transparent`, `opaque`, or `auto`; transparent requires PNG or WebP. |
-| `--output-format` | `output_format` | `png`, `jpeg`, or `webp`; default `png`. |
-| `--output-compression` | `output_compression` | 0-100 when supported. |
-| `--moderation` | `moderation` | Passed through when set. |
+## Edit-specific parameters
+- `image`: one or more input images. For GPT Image models, you can provide up to 16 images.
+- `mask`: optional mask image (PNG with alpha, same size and format as the first image)
+- `markup`: optional transparent PNG overlay with the same pixel size as the first image, for example a circle drawn around the object to change. It applies only to the first image. Do not combine it with `mask`. Supported on GPT Image 2.5 and 2.6. Uses normal edit rates.
+- `input_fidelity`: only for the deprecated 1.x models (`gpt-image-1.5`: `low` or `high`; `gpt-image-1-mini`: `low` only). Omit it for GPT Image 2 and newer: they always process input images at high fidelity, which can raise input-token cost.
 
-Edit-only parameters:
+## Output
+- `data[]` list with `b64_json` per image (for SVG, base64 of UTF-8 XML)
+- Streams emit `image_generation.partial_image` / `image_generation.completed` events (`image_edit.*` for edits).
+- Responses and completed events also report `size`, `quality`, `background`, `output_format`, and token `usage` (plus `svg_usage` for the SVG author model). These response fields are optional. The CLI prints the ones present on a `Result:` line.
+- The bundled `scripts/image_gen.py` CLI decodes `b64_json` and writes output files for you.
 
-| CLI option | API field | Notes |
-|---|---|---|
-| `--image` | multipart `image` | Repeat for multiple input images. |
-| `--mask` | multipart `mask` | PNG mask with alpha channel when supported. |
-| `--input-fidelity` | `input_fidelity` | `low` or `high` when supported. |
-
-## Model-specific selection guidance
-
-The rules in `SKILL.md` control when to infer settings or ask the user. The limits below describe OpenAI's documented GPT Image 2.5 API, not every compatible provider or alias. The CLI checks size syntax only and leaves provider-specific limits to the endpoint.
-
-For GPT Image 2.5 Flare and Sunburst, `xhigh` and `max` are additional quality settings. Use them to address an unmet requirement within the user's cost and latency limits. Do not assume that the same quality label produces equal results or costs across models. Do not apply these settings to older models or unknown aliases without evidence of support.
-
-When selecting custom dimensions for the documented OpenAI GPT Image 2.5 API, use these limits:
-
-- Make both dimensions multiples of 16 pixels.
-- Keep each dimension at or below 3840 pixels.
-- Keep the longer dimension at most three times the shorter dimension.
-- Keep the total pixel count between 655,360 and 8,294,400.
-
-Use the target layout to choose an aspect ratio, the width relative to the height. Common starting sizes are `1024x1024` for square, `1536x1024` for landscape, and `1024x1536` for portrait. Use a custom canvas such as `1536x864` for a known 16:9 layout. Do not infer a need for 4K from the word "hero" or "final" alone.
-
-OpenAI lists `3840x2160` and `2160x3840` as 4K options. Outputs above 3,686,400 total pixels (`2560x1440`) are experimental. Explain this limit before an applicable request. Do not silently change a requested canvas if the endpoint rejects it or returns different dimensions.
-
-These notes follow the [OpenAI image-prompting guide](https://developers.openai.com/api/docs/guides/image-prompting), checked September 12, 2026. Provider capabilities and pricing can change. Consult the selected provider's current documentation when its limits are unknown. A successful model listing or request does not prove that the backend honors every parameter.
-
-## Response handling
-
-The CLI accepts either response shape:
-
-```json
-{"data":[{"b64_json":"..."}]}
-```
-
-or:
-
-```json
-{"data":[{"url":"https://..."}]}
-```
-
-It writes decoded image bytes to the resolved output path and prints the path.
-
-If the endpoint returns `revised_prompt`, the CLI prints it to stderr for traceability.
-
-The CLI reports requested `model` and `size` values separately from backend-reported values. It does not replace a missing backend value with the request. It measures saved PNG, JPEG, and WebP dimensions from image bytes when possible. C2PA metadata alone is not definitive proof of the actual served model.
-
-The `models` command is optional discovery. Generation does not require it, and the client does not apply a model or billing fallback when a request fails.
-
-## Direct curl tests
-
-Direct generation/edit curl tests live in `references/troubleshooting.md`.
-
-## Invariants for safe edits
-
-Edits drift unless the prompt states the containment boundary. Repeat the invariant in every edit prompt:
-
-```text
-Change only <target region/object>. Keep <identity/pose/layout/lighting/text/edges> unchanged. No extra objects. No watermark.
-```
-
-For project assets, keep the original file untouched and write a sibling output such as `hero-edited.png` or `product-background-v2.png`.
+## Limits and notes
+- Input images, masks, and markup must be under 50MB.
+- Use the edits endpoint when the user requests changes to an existing image.
+- Masking and markup are prompt-guided; exact shapes are not guaranteed. If part of an image must stay pixel-identical, composite the approved edit into the original.
+- Large sizes and high quality increase latency and cost. Complex prompts can take up to 2 minutes.
+- `complexity`, `markup`, GIF, and SVG need `openai` Python SDK 3.46.0 or newer. Upgrade the SDK if a call fails with an unexpected keyword argument.
+- If a request fails because a specific option is unsupported by the selected GPT Image model, retry manually without that option.
