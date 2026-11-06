@@ -371,7 +371,6 @@ def _build_output_paths(
 
     if out_dir:
         out_base = Path(out_dir)
-        out_base.mkdir(parents=True, exist_ok=True)
         return [out_base / f"image_{i}{ext}" for i in range(1, count + 1)]
 
     out_path = Path(out)
@@ -886,7 +885,6 @@ def _job_output_paths(
     n: int,
     explicit_out: Optional[str],
 ) -> List[Path]:
-    out_dir.mkdir(parents=True, exist_ok=True)
     ext = "." + output_format
 
     if explicit_out:

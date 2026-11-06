@@ -527,6 +527,20 @@ class BatchTests(CliTestCase):
         self.assertEqual(result.stderr.count("gpt-image-1.5 is deprecated"), 1, result.stderr)
         self.assertIn("2026-12-01", result.stderr)
 
+    def test_output_folders_are_created_only_when_files_are_written(self) -> None:
+        # A rejected batch or a dry run must not leave empty output folders behind.
+        result = self.run_batch(json.dumps({"prompt": "ok"}), json.dumps({"prompt": "bad", "n": "two"}))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.tmp / "batch").exists())
+
+        result = self.run_batch(json.dumps({"prompt": "ok"}))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.tmp / "batch").exists())
+
+        result = run_cli("generate", "--prompt", "p", "--dry-run", "--out-dir", str(self.tmp / "one-off"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.tmp / "one-off").exists())
+
     def test_per_job_invalid_option_rejected(self) -> None:
         result = self.run_batch(json.dumps({"prompt": "a", "output_format": "svg", "n": 2}))
         self.assertNotEqual(result.returncode, 0)
@@ -1038,6 +1052,12 @@ class ExecutionTests(unittest.TestCase):
                     "--out", str(self.tmp / "x.png"),
                 )
                 self.assertNotIn("differs from the request", self.stderr)
+
+    def test_out_dir_is_created_when_the_image_is_written(self) -> None:
+        response = SimpleNamespace(data=[SimpleNamespace(b64_json=_b64(PNG_BYTES))])
+        out_dir = self.tmp / "new" / "folder"
+        self.run_main({"generate": response}, "generate", "--prompt", "x", "--out-dir", str(out_dir))
+        self.assertEqual((out_dir / "image_1.png").read_bytes(), PNG_BYTES)
 
     def test_format_mismatch_is_saved_under_the_real_extension(self) -> None:
         response = SimpleNamespace(data=[SimpleNamespace(b64_json=_b64(PNG_BYTES))], output_format="png")
